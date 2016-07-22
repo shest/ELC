@@ -432,7 +432,7 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
             final Map<String, PairedReadSequence> pendingByName = new HashMap<String, PairedReadSequence>();
             final SamReader in = SamReaderFactory.makeDefault().referenceSequence(REFERENCE_SEQUENCE).open(f);
             readGroups.addAll(in.getFileHeader().getReadGroups());
-            
+
             for (final SAMRecord rec : in) {
                 if (!rec.getReadPairedFlag()) continue;
                 if (!rec.getFirstOfPairFlag() && !rec.getSecondOfPairFlag()) {
@@ -460,7 +460,9 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
                 prs.qualityOk = prs.qualityOk && passesQualityCheck;
 
                 // Get the bases and restore them to their original orientation if necessary
-                final byte[] bases = rec.getReadBases();
+                int basesLen = rec.getReadLength();
+                final byte[] bases = new byte[basesLen];
+                System.arraycopy(rec.getReadBases(), 0, bases, 0, basesLen);
                 if (rec.getReadNegativeStrandFlag()) SequenceUtil.reverseComplement(bases);
 
                 final PairedReadSequenceWithBarcodes prsWithBarcodes = (useBarcodes) ? (PairedReadSequenceWithBarcodes) prs : null;
@@ -497,6 +499,7 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
 
         int groupsProcessed = 0;
         long lastLogTime = System.currentTimeMillis();
+
         final int meanGroupSize = (int) (Math.max(1, (progress.getCount() / 2) / (int) pow(4, MIN_IDENTICAL_BASES * 2)));
 
         while (iterator.hasNext()) {
@@ -528,12 +531,13 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
                     }
 
                     // Figure out if any reads within this group are duplicates of one another
-                    for (int i = 0; i < seqs.size(); ++i) {
+                    int size = seqs.size();
+                    for (int i = 0; i < size; ++i) {
                         final PairedReadSequence lhs = seqs.get(i);
                         if (lhs == null) continue;
                         final List<PairedReadSequence> dupes = new ArrayList<PairedReadSequence>();
 
-                        for (int j = i + 1; j < seqs.size(); ++j) {
+                        for (int j = i + 1; j < size; ++j) {
                             final PairedReadSequence rhs = seqs.get(j);
                             if (rhs == null) continue;
 
