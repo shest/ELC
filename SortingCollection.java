@@ -43,6 +43,7 @@ import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.TreeSet;
 
+
 /**
  * Collection to which many records can be added.  After all records are added, the collection can be
  * iterated, and the records will be returned in order defined by the comparator.  Records may be spilled
@@ -113,8 +114,10 @@ public class SortingCollection<T> implements Iterable<T> {
     private final int maxRecordsInRam;
     private int numRecordsInRam = 0;
     private T[] ramRecords;
+    private T[] tmp;
     private boolean iterationStarted = false;
     private boolean doneAdding = false;
+    private volatile boolean finishedSpilling = true;
 
     /**
      * Set to true when all temp files have been cleaned up
@@ -153,6 +156,7 @@ public class SortingCollection<T> implements Iterable<T> {
         this.comparator = comparator;
         this.maxRecordsInRam = maxRecordsInRam;
         this.ramRecords = (T[])Array.newInstance(componentType, maxRecordsInRam);
+        this.tmp = (T[])Array.newInstance(componentType, maxRecordsInRam);
     }
 
     public void add(final T rec) {
@@ -163,7 +167,18 @@ public class SortingCollection<T> implements Iterable<T> {
             throw new IllegalStateException("Cannot add after calling iterator()");
         }
         if (numRecordsInRam == maxRecordsInRam) {
-            spillToDisk();
+            while (!finishedSpilling) {
+                if (finishedSpilling) break;
+            }
+            int size = numRecordsInRam;
+            System.arraycopy(ramRecords, 0, tmp, 0, size);
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    spillToDisk(tmp, size);
+                }
+            }).start();
+            numRecordsInRam = 0;
         }
         ramRecords[numRecordsInRam++] = rec;
     }
@@ -188,7 +203,8 @@ public class SortingCollection<T> implements Iterable<T> {
         }
 
         if (this.numRecordsInRam > 0) {
-            spillToDisk();
+            spillToDisk(ramRecords, numRecordsInRam);
+            this.numRecordsInRam = 0;
         }
 
         // Facilitate GC
@@ -214,21 +230,24 @@ public class SortingCollection<T> implements Iterable<T> {
     /**
      * Sort the records in memory, write them to a file, and clear the buffer of records in memory.
      */
-    private void spillToDisk() {
+    private void spillToDisk(T[] tmp, int size) {
         try {
-            Arrays.sort(this.ramRecords, 0, this.numRecordsInRam, this.comparator);
+            finishedSpilling = false;
+            System.err.println("Thread" + Thread.currentThread().getId() + " start spilling " + size + " records");
+            Arrays.sort(tmp, 0, size, this.comparator);
             final File f = newTempFile();
             OutputStream os = null;
             try {
                 os = tempStreamFactory.wrapTempOutputStream(new FileOutputStream(f), Defaults.BUFFER_SIZE);
                 this.codec.setOutputStream(os);
-                for (int i = 0; i < this.numRecordsInRam; ++i) {
-                    this.codec.encode(ramRecords[i]);
+                for (int i = 0; i < size; ++i) {
+                    this.codec.encode(tmp[i]);
                     // Facilitate GC
-                    this.ramRecords[i] = null;
+                    this.tmp[i] = null;
                 }
 
                 os.flush();
+                System.err.println("spilling finished to " + f);
             } catch (RuntimeIOException ex) {
                 throw new RuntimeIOException("Problem writing temporary file " + f.getAbsolutePath() +
                         ".  Try setting TMP_DIR to a file system with lots of space.", ex);
@@ -236,9 +255,10 @@ public class SortingCollection<T> implements Iterable<T> {
                 if (os != null) {
                     os.close();
                 }
+                finishedSpilling = true;
             }
 
-            this.numRecordsInRam = 0;
+//            this.numRecordsInRam = 0;
             this.files.add(f);
 
         }
