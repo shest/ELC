@@ -24,6 +24,7 @@
 
 package picard.sam.markduplicates;
 
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import htsjdk.samtools.*;
 import htsjdk.samtools.metrics.MetricsFile;
 import htsjdk.samtools.util.*;
@@ -37,18 +38,11 @@ import picard.sam.markduplicates.util.AbstractOpticalDuplicateFinderCommandLineP
 import picard.sam.markduplicates.util.OpticalDuplicateFinder;
 import picard.sam.util.PhysicalLocationShort;
 
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.io.EOFException;
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
+import java.io.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.stream.IntStream;
 
-import static java.lang.Math.log;
 import static java.lang.Math.pow;
 
 /**
@@ -408,7 +402,7 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
         } else {
             sizeInBytes = PairedReadSequence.getSizeInBytes();
         }
-        MAX_RECORDS_IN_RAM = (int) (Runtime.getRuntime().maxMemory() / sizeInBytes) / 4 / THREAD_CNT;
+        MAX_RECORDS_IN_RAM = (int) (Runtime.getRuntime().maxMemory() / sizeInBytes) / (3 * THREAD_CNT);
     }
 
     /**
@@ -416,6 +410,8 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
      * read sequences of each read pair and sorts them via a SortingCollection.  Then traverses
      * the sorted reads and looks at small groups at a time to find duplicates.
      */
+    volatile boolean readingFinished = false;
+
     @Override
     protected int doWork() {
         for (final File f : INPUT) IOUtil.assertFileIsReadable(f);
@@ -428,14 +424,98 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
         // Loop through the input files and pick out the read sequences etc.
         final ProgressLogger progress = new ProgressLogger(log, (int) 1e6, "Read");
         List<SAMRecordIterator> iters = new ArrayList<>();
-        List<SortingCollection<PairedReadSequence>> sorters = new ArrayList<>();
         List<SamReader> readers = new ArrayList<>();
-        ExecutorService exec = Executors.newFixedThreadPool(THREAD_CNT);
+//        ExecutorService exec = Executors.newFixedThreadPool(THREAD_CNT);
+        SortingCollection<PairedReadSequence> sorter = SortingCollection.newInstance(PairedReadSequence.class,
+                new PairedReadCodec(),
+                new PairedReadComparator(),
+                MAX_RECORDS_IN_RAM,
+                TMP_DIR);
+        long readTime = System.currentTimeMillis();
         for (final File f : INPUT) {
             final Map<String, PairedReadSequence> pendingByName = new ConcurrentHashMap<>();
             final SamReader tmp = SamReaderFactory.makeDefault().referenceSequence(REFERENCE_SEQUENCE).open(f);
             SAMFileHeader header = tmp.getFileHeader();
             readGroups.addAll(header.getReadGroups());
+
+            BlockingQueue<SAMRecord> records = new ArrayBlockingQueue<SAMRecord>(1000);
+            final ThreadFactory threadFactoryReader = new ThreadFactoryBuilder()
+                    .setNameFormat("FileReader-%d")
+                    .setDaemon(true)
+                    .build();
+            final ThreadFactory threadFactoryRPS = new ThreadFactoryBuilder()
+                    .setNameFormat("RpsMaker-%d")
+                    .setDaemon(true)
+                    .build();
+            ExecutorService fileReader = Executors.newFixedThreadPool(THREAD_CNT);
+            ExecutorService rpsMaker = Executors.newSingleThreadExecutor(threadFactoryRPS);
+            class PrsMaker implements Runnable {
+                BlockingQueue<SAMRecord> records;
+                PrsMaker(final BlockingQueue<SAMRecord> records) {
+                    this.records = records;
+                }
+                @Override
+                public void run() {
+                    while(true) {
+                        SAMRecord rec = null;
+                        try {
+                            rec = records.poll(5, TimeUnit.SECONDS);
+                        } catch (InterruptedException e) {
+                            e.printStackTrace();
+                        }
+                        if (rec == null) break;
+                        if (!rec.getReadPairedFlag()) continue;
+                        if (!rec.getFirstOfPairFlag() && !rec.getSecondOfPairFlag()) {
+                            continue;
+                        }
+                        if (rec.isSecondaryOrSupplementary()) continue;
+                        PairedReadSequence prs = pendingByName.remove(rec.getReadName());
+                        if (prs == null) {
+                            // Make a new paired read object and add RG and physical location information to it
+                            prs = useBarcodes ? new PairedReadSequenceWithBarcodes() : new PairedReadSequence();
+                            if (opticalDuplicateFinder.addLocationInformation(rec.getReadName(), prs)) {
+                                final SAMReadGroupRecord rg = rec.getReadGroup();
+                                if (rg != null) prs.setReadGroup((short) readGroups.indexOf(rg));
+                            }
+
+                            pendingByName.put(rec.getReadName(), prs);
+                        }
+
+                        // Read passes quality check if both ends meet the mean quality criteria
+                        final boolean passesQualityCheck = passesQualityCheck(rec.getReadBases(),
+                                rec.getBaseQualities(),
+                                MIN_IDENTICAL_BASES,
+                                MIN_MEAN_QUALITY);
+                        prs.qualityOk = prs.qualityOk && passesQualityCheck;
+
+                        // Get the bases and restore them to their original orientation if necessary
+                        int basesLen = rec.getReadLength();
+                        final byte[] bases = new byte[basesLen];
+
+                        System.arraycopy(rec.getReadBases(), 0, bases, 0, basesLen);
+                        if (rec.getReadNegativeStrandFlag()) SequenceUtil.reverseComplement(bases);
+
+                        final PairedReadSequenceWithBarcodes prsWithBarcodes = (useBarcodes) ? (PairedReadSequenceWithBarcodes) prs : null;
+                        if (rec.getFirstOfPairFlag()) {
+                            prs.read1 = bases;
+                            if (useBarcodes) {
+                                prsWithBarcodes.barcode = getBarcodeValue(rec);
+                                prsWithBarcodes.readOneBarcode = getReadOneBarcodeValue(rec);
+                            }
+                        } else {
+                            prs.read2 = bases;
+                            if (useBarcodes) {
+                                prsWithBarcodes.readTwoBarcode = getReadTwoBarcodeValue(rec);
+                            }
+                        }
+                        if (prs.read1 != null && prs.read2 != null && prs.qualityOk) {
+                            sorter.add(prs);
+                        }
+                        progress.record(rec);
+                    }
+                }
+            }
+
             List<SAMSequenceRecord> seqDict = header.getSequenceDictionary().getSequences();
             int seqCnt = seqDict.size();
 
@@ -471,108 +551,56 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
                     //interchange of overlapping and containing flags
                     SAMRecordIterator it = reader.query(seq.getSequenceName(), startChunk, endChunk, j % 2 == 0 ? false : true);
 
-                    SortingCollection<PairedReadSequence> sorter = SortingCollection.newInstance(PairedReadSequence.class,
-                            new PairedReadCodec(),
-                            new PairedReadComparator(),
-                            MAX_RECORDS_IN_RAM,
-                            TMP_DIR);
                     readers.add(reader);
                     iters.add(it);
-                    sorters.add(sorter);
-                    final Object mutex = new Object();
-                    exec.execute(new Runnable() {
+
+                    fileReader.execute(new Runnable() {
                         @Override
                         public void run() {
-                            System.err.println("Thread " + Thread.currentThread().getId() + "start process " + seq.getSequenceName());
-                            synchronized (mutex) {
+                            SAMRecord rec = null;
                             while (it.hasNext()) {
-                                SAMRecord rec = it.next();
-                                if (!rec.getReadPairedFlag()) continue;
-                                if (!rec.getFirstOfPairFlag() && !rec.getSecondOfPairFlag()) {
-                                    continue;
+                                try {
+                                    rec = it.next();
+                                    records.put(rec);
+
+                                } catch (InterruptedException e) {
+                                    e.printStackTrace();
                                 }
-                                if (rec.isSecondaryOrSupplementary()) continue;
-                                PairedReadSequence prs;
-                                prs = pendingByName.remove(rec.getReadName());
-                                if (prs == null) {
-                                    // Make a new paired read object and add RG and physical location information to it
-                                    prs = useBarcodes ? new PairedReadSequenceWithBarcodes() : new PairedReadSequence();
-                                    if (opticalDuplicateFinder.addLocationInformation(rec.getReadName(), prs)) {
-                                        final SAMReadGroupRecord rg = rec.getReadGroup();
-                                        if (rg != null) prs.setReadGroup((short) readGroups.indexOf(rg));
-                                    }
-                                    pendingByName.put(rec.getReadName(), prs);
-                                }
-
-                                // Read passes quality check if both ends meet the mean quality criteria
-                                final boolean passesQualityCheck = passesQualityCheck(rec.getReadBases(),
-                                        rec.getBaseQualities(),
-                                        MIN_IDENTICAL_BASES,
-                                        MIN_MEAN_QUALITY);
-                                prs.qualityOk = prs.qualityOk && passesQualityCheck;
-
-                                // Get the bases and restore them to their original orientation if necessary
-                                int basesLen = rec.getReadLength();
-                                final byte[] bases = new byte[basesLen];
-                                System.arraycopy(rec.getReadBases(), 0, bases, 0, basesLen);
-                                if (rec.getReadNegativeStrandFlag()) SequenceUtil.reverseComplement(bases);
-
-                                final PairedReadSequenceWithBarcodes prsWithBarcodes = (useBarcodes) ? (PairedReadSequenceWithBarcodes) prs : null;
-
-                                if (rec.getFirstOfPairFlag()) {
-                                    prs.read1 = bases;
-                                    if (useBarcodes) {
-                                        prsWithBarcodes.barcode = getBarcodeValue(rec);
-                                        prsWithBarcodes.readOneBarcode = getReadOneBarcodeValue(rec);
-                                    }
-                                } else {
-                                    prs.read2 = bases;
-                                    if (useBarcodes) {
-                                        prsWithBarcodes.readTwoBarcode = getReadTwoBarcodeValue(rec);
-                                    }
-                                }
-
-                                if (prs.read1 != null && prs.read2 != null && prs.qualityOk) {
-                                    sorter.add(prs);
-                                }
-//                                synchronized (progress) {
-                                    progress.record(rec);
-//                                }
-                            }                            }
-
+                            }
+                            readingFinished = true;
                         }
                     });
+
                     startChunk = endChunk + 1;
 
                 }
                 start = end + 1;
             }
-        }
 
-        exec.shutdown();
-
-        try {
-            exec.awaitTermination(1, TimeUnit.HOURS);
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-        } finally {
-            int cnt = readers.size();
-            for (int i = 0; i < cnt; ++i) {
-                CloserUtil.close(readers.get(i));
+            rpsMaker.execute(new PrsMaker(records));
+            fileReader.shutdown();
+            try {
+                fileReader.awaitTermination(1, TimeUnit.HOURS);
+                rpsMaker.shutdown();
+                rpsMaker.awaitTermination(1, TimeUnit.HOURS);
+                System.out.println("rest size: " + records.size());
+            } catch (InterruptedException e) {
+                e.printStackTrace();
             }
+
         }
 
-        // merge all files
-        int sorterCnt = sorters.size();
-        for (int i = 1; i < sorterCnt; ++i) {
-            iters.get(i).close();
-            sorters.get(0).merge(sorters.get(i));
+        int readersSize = readers.size();
+        for (int i = 0; i < readersSize; ++i) {
+            CloserUtil.close(readers.get(i));
         }
+
+        System.out.println("reading time: " + (System.currentTimeMillis() - readTime));
 
         log.info(String.format("Finished reading - read %d records - moving on to scanning for duplicates.", progress.getCount()));
 
         // Now go through the sorted reads and attempt to find duplicates
-        final PeekableIterator<PairedReadSequence> iterator = new PeekableIterator<PairedReadSequence>(sorters.get(0).iterator());
+        final PeekableIterator<PairedReadSequence> iterator = new PeekableIterator<PairedReadSequence>(sorter.iterator());
 
         final Map<String, Histogram<Integer>> duplicationHistosByLibrary = new HashMap<String, Histogram<Integer>>();
         final Map<String, Histogram<Integer>> opticalHistosByLibrary = new HashMap<String, Histogram<Integer>>();
@@ -655,7 +683,7 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
         long seconds = (System.currentTimeMillis() - start) / 1000L;
         System.err.println("Processing read seq pairs: " + seconds/60L + ":" + seconds%60 + "s");
         iterator.close();
-        sorters.get(0).cleanup();
+        sorter.cleanup();
 
         final MetricsFile<DuplicationMetrics, Integer> file = getMetricsFile();
         for (final String library : duplicationHistosByLibrary.keySet()) {
