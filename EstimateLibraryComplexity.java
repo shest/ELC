@@ -610,6 +610,16 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
         long start = System.currentTimeMillis();
         final int meanGroupSize = (int) (Math.max(1, (progress.getCount() / 2) / (int) pow(4, MIN_IDENTICAL_BASES * 2)));
 
+//        BlockingQueue<List<PairedReadSequence>> prsBuffer = new LinkedBlockingQueue<>(1000);
+//        ExecutorService counter = Executors.newSingleThreadExecutor();
+//        ExecutorService groupMaker = Executors.newSingleThreadExecutor();
+//
+//        groupMaker.execute(new Runnable() {
+//            @Override
+//            public void run() {
+//
+//            }
+//        });
         while (iterator.hasNext()) {
             // Get the next group and split it apart by library
             final List<PairedReadSequence> group = getNextGroup(iterator);
@@ -681,7 +691,7 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
         }
         log.info("Processed " + groupsProcessed + " groups.");
         long seconds = (System.currentTimeMillis() - start) / 1000L;
-        System.err.println("Processing read seq pairs: " + seconds/60L + ":" + seconds%60 + "s");
+        System.out.println("Processing read seq pairs: " + seconds);
         iterator.close();
         sorter.cleanup();
 
@@ -799,15 +809,13 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
         final PairedReadSequence first = iterator.next();
         group.add(first);
 
-        outer:
         while (iterator.hasNext()) {
             final PairedReadSequence next = iterator.peek();
-            for (int i = 0; i < MIN_IDENTICAL_BASES; ++i) {
-                if (first.read1[i] != next.read1[i] || first.read2[i] != next.read2[i]) break outer;
+            if (next.read1[MIN_IDENTICAL_BASES - 1] != first.read1[MIN_IDENTICAL_BASES - 1]) return group;
+            for (int i = MIN_IDENTICAL_BASES - 1; i >= 0; --i) {
+                if (first.read2[i] != next.read2[i]) return group;
             }
-
             group.add(iterator.next());
-
         }
 
         return group;
