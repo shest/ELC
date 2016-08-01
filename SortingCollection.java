@@ -25,24 +25,12 @@ package htsjdk.samtools.util;
 
 import htsjdk.samtools.Defaults;
 
-import java.util.concurrent.*;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.io.Serializable;
+import java.io.*;
 import java.lang.reflect.Array;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Comparator;
-import java.util.Iterator;
-import java.util.List;
-import java.util.NoSuchElementException;
-import java.util.TreeSet;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Collection to which many records can be added.  After all records are added, the collection can be
@@ -96,6 +84,10 @@ public class SortingCollection<T> implements Iterable<T> {
         Codec<T> clone();
     }
 
+    public interface SplitCondition<T> {
+        boolean shouldSplit(T lhs, T rhs);
+    }
+
     /** Directories where files of sorted records go. */
     private final File[] tmpDirs;
 
@@ -127,13 +119,13 @@ public class SortingCollection<T> implements Iterable<T> {
     /**
      * List of files in tmpDir containing sorted records
      */
-    private final List<File> files = new ArrayList<File>();
+    private final List<File> files = new LinkedList<File>();
 
     private boolean destructiveIteration = true;
 
     private TempStreamFactory tempStreamFactory = new TempStreamFactory();
 
-    private Object mutex;
+    private SplitCondition<T> splitter;
 
     private ExecutorService spiller = Executors.newSingleThreadExecutor();
 
@@ -193,19 +185,19 @@ public class SortingCollection<T> implements Iterable<T> {
 
         doneAdding = true;
 
-        spiller.shutdown();
-        try {
-            spiller.awaitTermination(1, TimeUnit.HOURS);
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-        }
-
         if (this.files.isEmpty()) {
             return;
         }
 
         if (this.numRecordsInRam > 0) {
-            spillToDisk();
+//            spillToDisk();
+            spiller.submit(new Spiller());
+            spiller.shutdown();
+            try {
+                spiller.awaitTermination(1, TimeUnit.HOURS);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
         }
 
         // Facilitate GC
@@ -277,11 +269,20 @@ public class SortingCollection<T> implements Iterable<T> {
             try {
                 Arrays.sort(tmp, 0, lenght, comparator);
                 File f = newTempFile();
-                    OutputStream os = null;
+                OutputStream os = null;
+                T first = tmp[0];
                     try {
                         os = tempStreamFactory.wrapTempOutputStream(new FileOutputStream(f), Defaults.BUFFER_SIZE);
                         codec.setOutputStream(os);
                         for (int i = 0; i < lenght; ++i) {
+                            if (splitter.shouldSplit(first, tmp[i])) {
+                                first = tmp[i];
+                                os.flush();
+                                files.add(f);
+                                f = newTempFile();
+                                os = tempStreamFactory.wrapTempOutputStream(new FileOutputStream(f), Defaults.BUFFER_SIZE);
+                                codec.setOutputStream(os);
+                            }
                             codec.encode(tmp[i]);
                             // Facilitate GC
                             tmp[i] = null;
@@ -329,6 +330,21 @@ public class SortingCollection<T> implements Iterable<T> {
         } else {
             return new MergingIterator();
         }
+    }
+
+    public boolean canSplit() {
+        doneAdding();
+        return !this.files.isEmpty();
+    }
+
+    public List<CloseableIterator<T>> split() {
+        doneAdding();
+        if (files.isEmpty()) {
+            throw new IllegalStateException("Cannot split InMemory iterator");
+        }
+        List<CloseableIterator<T>> ret = new MergingIterator().split();
+        this.iterationStarted = true;
+        return  ret;
     }
 
     /**
@@ -384,7 +400,7 @@ public class SortingCollection<T> implements Iterable<T> {
     public static <T> SortingCollection<T> newInstance(final Class<T> componentType,
                                                        final SortingCollection.Codec<T> codec,
                                                        final Comparator<T> comparator,
-                                                       final Object mutex,
+                                                       final SplitCondition<T> splitter,
                                                        final int maxRecordsInRAM,
                                                        final Collection<File> tmpDirs) {
         SortingCollection<T> s = new SortingCollection<T>(componentType,
@@ -392,7 +408,7 @@ public class SortingCollection<T> implements Iterable<T> {
                 comparator,
                 maxRecordsInRAM,
                 tmpDirs.toArray(new File[tmpDirs.size()]));
-        s.mutex = mutex;
+        s.splitter = splitter;
         return s;
     }
 
@@ -467,7 +483,8 @@ public class SortingCollection<T> implements Iterable<T> {
      */
     class MergingIterator implements CloseableIterator<T> {
         private final TreeSet<PeekFileRecordIterator> queue;
-
+        private PeekFileRecordIterator currentFileIterator;
+        private boolean inOneGroup = true;
         MergingIterator() {
             this.queue = new TreeSet<PeekFileRecordIterator>(new PeekFileRecordIteratorComparator());
             int n = 0;
@@ -480,6 +497,31 @@ public class SortingCollection<T> implements Iterable<T> {
                     it.close();
                 }
             }
+            currentFileIterator = queue.first();
+        }
+
+        MergingIterator(TreeSet<PeekFileRecordIterator> queue) {
+            this.queue = new TreeSet<PeekFileRecordIterator>(new PeekFileRecordIteratorComparator());
+            this.queue.addAll(queue);
+            currentFileIterator = queue.first();
+        }
+
+        public List<CloseableIterator<T>> split() {
+            List<CloseableIterator<T>> list = new ArrayList<>();
+            TreeSet<PeekFileRecordIterator> splitQueue = new TreeSet<PeekFileRecordIterator>(new PeekFileRecordIteratorComparator());
+            T first = queue.first().peek();
+            for (PeekFileRecordIterator it : queue) {
+                if (!splitter.shouldSplit(first, it.peek())) {
+                    splitQueue.add(it);
+                } else {
+                    list.add(new MergingIterator(splitQueue));
+                    splitQueue.clear();
+                    splitQueue.add(it);
+                    first = it.peek();
+                }
+            }
+            list.add(new MergingIterator(splitQueue));
+            return list;
         }
 
         public boolean hasNext() {
@@ -491,14 +533,28 @@ public class SortingCollection<T> implements Iterable<T> {
                 throw new NoSuchElementException();
             }
 
-            final PeekFileRecordIterator fileIterator = queue.pollFirst();
-            final T ret = fileIterator.next();
-            if (fileIterator.hasNext()) {
-                this.queue.add(fileIterator);
+            final T ret = currentFileIterator.next();
+            if (!currentFileIterator.hasNext()) {
+                queue.pollFirst();
+                if (!queue.isEmpty()) currentFileIterator = queue.first();
             }
-            else {
-                ((CloseableIterator<T>)fileIterator.getUnderlyingIterator()).close();
+            else if (comparator.compare(ret, currentFileIterator.peek()) != 0) {
+                queue.pollFirst();
+                queue.add(currentFileIterator);
+                currentFileIterator = queue.first();
+                if (comparator.compare(currentFileIterator.peek(), ret) != 0) {
+                    inOneGroup = false;
+                }
             }
+
+//            final PeekFileRecordIterator fileIterator = queue.pollFirst();
+//            final T ret = fileIterator.next();
+//            if (fileIterator.hasNext()) {
+//                this.queue.add(fileIterator);
+//            }
+//            else {
+//                ((CloseableIterator<T>)fileIterator.getUnderlyingIterator()).close();
+//            }
 
             return ret;
         }
@@ -512,6 +568,14 @@ public class SortingCollection<T> implements Iterable<T> {
                 final PeekFileRecordIterator it = this.queue.pollFirst();
                 ((CloseableIterator<T>)it.getUnderlyingIterator()).close();
             }
+        }
+
+        public boolean isInOneGroup() {
+            return inOneGroup;
+        }
+
+        public void setGroupFlag(boolean flag) {
+            inOneGroup = flag;
         }
     }
 
@@ -584,4 +648,5 @@ public class SortingCollection<T> implements Iterable<T> {
             else return result;
         }
     }
+
 }
