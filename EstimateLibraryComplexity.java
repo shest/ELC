@@ -41,8 +41,7 @@ import picard.sam.util.PhysicalLocationShort;
 import java.io.*;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.IntStream;
 
 import static java.lang.Math.pow;
@@ -617,23 +616,21 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
         final Map<String, Histogram<Integer>> duplicationHistosByLibrary = new HashMap<String, Histogram<Integer>>();
         final Map<String, Histogram<Integer>> opticalHistosByLibrary = new HashMap<String, Histogram<Integer>>();
 
-        AtomicInteger groupsProcessed = new AtomicInteger(0);
-
-        AtomicLong lastLogTime = new AtomicLong(System.currentTimeMillis());
+        LongAdder groupsProcessed = new LongAdder();
+        LongAdder lastLogTime = new LongAdder();
+        lastLogTime.add(System.currentTimeMillis());
         long start = System.currentTimeMillis();
         final int meanGroupSize = (int) (Math.max(1, (progress.getCount() / 2) / (int) pow(4, MIN_IDENTICAL_BASES * 2)));
 
-        ExecutorService counter = Executors.newFixedThreadPool(THREAD_CNT);
-
-        long processTime = 0;
-        while (iterator.hasNext()) {
-            // Get the next group and split it apart by library
-            List<PairedReadSequence> chunk = getNextGroup(iterator);
-
-            counter.submit(new Runnable() {
-                List<PairedReadSequence> group = chunk;
-                @Override
-                public void run() {
+        class DuplFinder implements Runnable {
+            List<List<PairedReadSequence>> list;
+            DuplFinder(List<List<PairedReadSequence>> list) {
+                this.list = new ArrayList<List<PairedReadSequence>>();
+                this.list.addAll(list);
+            }
+            @Override
+            public void run() {
+                for (List<PairedReadSequence> group : list) {
                     if (group.size() > meanGroupSize * MAX_GROUP_RATIO) {
                         final PairedReadSequence prs = group.get(0);
                         log.warn("Omitting group with over " + MAX_GROUP_RATIO + " times the expected mean number of read pairs. " +
@@ -692,16 +689,49 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
 
                         }
 
-                        groupsProcessed.incrementAndGet();
-                        if (lastLogTime.get() < System.currentTimeMillis() - 60000) {
+                        groupsProcessed.increment();
+                        if (lastLogTime.longValue() < System.currentTimeMillis() - 60000) {
                             log.info("Processed " + groupsProcessed + " groups.");
-                            lastLogTime.set(System.currentTimeMillis());
+                            lastLogTime.reset();
+                            lastLogTime.add(System.currentTimeMillis());
                         }
                     }
                 }
-            });
-
+            }
         }
+
+        ExecutorService counter = Executors.newSingleThreadExecutor();
+        final int CAPACITY = 1000;
+        List<List<PairedReadSequence>> list = new ArrayList<List<PairedReadSequence>>();
+        long processTime = 0;
+        while (iterator.hasNext()) {
+            // Get the next group and split it apart by library
+            List<PairedReadSequence> chunk = getNextGroup(iterator);
+            list.add(chunk);
+            if (list.size() < CAPACITY) {
+                continue;
+            }
+            counter.submit(new DuplFinder(list));
+            list = new ArrayList<>();
+        }
+
+        counter.shutdown();
+        try {
+            counter.awaitTermination(1, TimeUnit.HOURS);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+
+        if (!list.isEmpty()) {
+            Thread t = new Thread(new DuplFinder(list));
+            t.start();
+            try {
+                t.join();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+
 
 
         log.info("Processed " + groupsProcessed + " groups.");
