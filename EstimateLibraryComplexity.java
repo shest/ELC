@@ -39,6 +39,8 @@ import picard.sam.markduplicates.util.OpticalDuplicateFinder;
 import picard.sam.util.PhysicalLocationShort;
 
 import java.io.*;
+import java.nio.BufferUnderflowException;
+import java.nio.MappedByteBuffer;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.LongAdder;
@@ -251,8 +253,11 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
      * Codec class for writing and read PairedReadSequence objects.
      */
     static class PairedReadCodec implements SortingCollection.Codec<PairedReadSequence> {
+        static long load = 0;
+
         protected DataOutputStream out;
         protected DataInputStream in;
+        protected MappedByteBuffer buffer;
 
         public void setOutputStream(final OutputStream out) {
             this.out = new DataOutputStream(out);
@@ -261,6 +266,8 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
         public void setInputStream(final InputStream in) {
             this.in = new DataInputStream(in);
         }
+
+        public void setMappedBuffer(final MappedByteBuffer buffer) { this.buffer = buffer;}
 
         public void encode(final PairedReadSequence val) {
             try {
@@ -278,34 +285,48 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
         }
 
         public PairedReadSequence decode() {
-            try {
+//            if (!buffer.hasRemaining()) return null;
                 final PairedReadSequence val = new PairedReadSequence();
+//            try {
                 try {
-                    val.readGroup = this.in.readShort();
-                } catch (final EOFException eof) {
+//                    val.readGroup = this.in.readShort();
+                    val.readGroup = this.buffer.getShort();
+
+//                } catch (final EOFException eof) {
+//                    return null;
+//                }
+                } catch (final BufferUnderflowException ex) {
                     return null;
                 }
+//                val.tile = this.in.readShort();
+                val.tile = this.buffer.getShort();
+//                val.x = this.in.readShort();
+                val.x = this.buffer.getShort();
+//                val.y = this.in.readShort();
+                val.y = this.buffer.getShort();
 
-                val.tile = this.in.readShort();
-                val.x = this.in.readShort();
-                val.y = this.in.readShort();
-
-                int length = this.in.readInt();
+//                int length = this.in.readInt();
+                int length = this.buffer.getInt();
+                long time = System.currentTimeMillis();
                 val.read1 = new byte[length];
-                if (this.in.read(val.read1) != length) {
-                    throw new PicardException("Could not read " + length + " bytes from temporary file.");
-                }
-
-                length = this.in.readInt();
+                this.buffer.get(val.read1);
+//                if (this.in.read(val.read1) != length) {
+//                    throw new PicardException("Could not read " + length + " bytes from temporary file.");
+//                }
+                load += System.currentTimeMillis() - time;
+//                length = this.in.readInt();
+                length = this.buffer.getInt();
+                time = System.currentTimeMillis();
                 val.read2 = new byte[length];
-                if (this.in.read(val.read2) != length) {
-                    throw new PicardException("Could not read " + length + " bytes from temporary file.");
-                }
-
+                this.buffer.get(val.read2);
+//                if (this.in.read(val.read2) != length) {
+//                    throw new PicardException("Could not read " + length + " bytes from temporary file.");
+//                }
+                load += System.currentTimeMillis() - time;
                 return val;
-            } catch (final IOException ioe) {
-                throw new PicardException("Exception reading read pair.", ioe);
-            }
+//            } catch (final IOException ioe) {
+//                throw new PicardException("Exception reading read pair.", ioe);
+//            }
         }
 
         @Override
@@ -623,14 +644,12 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
         final int meanGroupSize = (int) (Math.max(1, (progress.getCount() / 2) / (int) pow(4, MIN_IDENTICAL_BASES * 2)));
 
         class DuplFinder implements Runnable {
-            List<List<PairedReadSequence>> list;
-            DuplFinder(List<List<PairedReadSequence>> list) {
-                this.list = new ArrayList<List<PairedReadSequence>>();
-                this.list.addAll(list);
+            List<PairedReadSequence> group;
+            DuplFinder(List<PairedReadSequence> list) {
+                this.group = list;
             }
             @Override
             public void run() {
-                for (List<PairedReadSequence> group : list) {
                     if (group.size() > meanGroupSize * MAX_GROUP_RATIO) {
                         final PairedReadSequence prs = group.get(0);
                         log.warn("Omitting group with over " + MAX_GROUP_RATIO + " times the expected mean number of read pairs. " +
@@ -696,49 +715,46 @@ public class EstimateLibraryComplexity extends AbstractOpticalDuplicateFinderCom
                             lastLogTime.add(System.currentTimeMillis());
                         }
                     }
+                    group.clear();
+                    group = null;
+            }
+        }
+
+        class GroupMaker implements Runnable {
+            private final ExecutorService finder;
+            GroupMaker(final ExecutorService finder) {
+                this.finder = finder;
+            }
+            @Override
+            public void run() {
+                while (iterator.hasNext()) {
+                    finder.submit(new DuplFinder(getNextGroup(iterator)));
                 }
             }
         }
 
         ExecutorService counter = Executors.newSingleThreadExecutor();
-        final int CAPACITY = 1000;
-        List<List<PairedReadSequence>> list = new ArrayList<List<PairedReadSequence>>();
-        long processTime = 0;
-        while (iterator.hasNext()) {
-            // Get the next group and split it apart by library
-            List<PairedReadSequence> chunk = getNextGroup(iterator);
-            list.add(chunk);
-            if (list.size() < CAPACITY) {
-                continue;
-            }
-            counter.submit(new DuplFinder(list));
-            list = new ArrayList<>();
-        }
+        ExecutorService groupMaker = Executors.newSingleThreadExecutor();
 
-        counter.shutdown();
+        long processTime = 0;
+
+        groupMaker.submit(new GroupMaker(counter));
+        groupMaker.shutdown();
+
         try {
+            groupMaker.awaitTermination(1, TimeUnit.HOURS);
+            counter.shutdown();
             counter.awaitTermination(1, TimeUnit.HOURS);
         } catch (InterruptedException e) {
             e.printStackTrace();
         }
 
-        if (!list.isEmpty()) {
-            Thread t = new Thread(new DuplFinder(list));
-            t.start();
-            try {
-                t.join();
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
-        }
-
-
 
         log.info("Processed " + groupsProcessed + " groups.");
         long seconds = (System.currentTimeMillis() - start);
         System.out.println("Processing read seq pairs: " + seconds);
-//        System.out.println("make group: " + getGroupTime);
         System.out.println("get next iter: " + getNextIter);
+        System.out.println("loading time: " + PairedReadCodec.load);
         System.out.println("process: " + processTime);
         iterator.close();
         sorter.cleanup();
