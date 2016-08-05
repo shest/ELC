@@ -27,6 +27,8 @@ import htsjdk.samtools.Defaults;
 
 import java.io.*;
 import java.lang.reflect.Array;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -82,6 +84,8 @@ public class SortingCollection<T> implements Iterable<T> {
          * that each is reading a separate file.
          */
         Codec<T> clone();
+
+        void setMappedBuffer(MappedByteBuffer buffer);
     }
 
     public interface SplitCondition<T> {
@@ -481,10 +485,11 @@ public class SortingCollection<T> implements Iterable<T> {
      * the PriorityQueue.  Because it now has a different record as its next element, it may go into another
      * location in the PriorityQueue
      */
+    long decodeTime = 0;
+
     class MergingIterator implements CloseableIterator<T> {
         private final TreeSet<PeekFileRecordIterator> queue;
         private PeekFileRecordIterator currentFileIterator;
-        private boolean inOneGroup = true;
         MergingIterator() {
             this.queue = new TreeSet<PeekFileRecordIterator>(new PeekFileRecordIteratorComparator());
             int n = 0;
@@ -542,9 +547,6 @@ public class SortingCollection<T> implements Iterable<T> {
                 queue.pollFirst();
                 queue.add(currentFileIterator);
                 currentFileIterator = queue.first();
-                if (comparator.compare(currentFileIterator.peek(), ret) != 0) {
-                    inOneGroup = false;
-                }
             }
 
 //            final PeekFileRecordIterator fileIterator = queue.pollFirst();
@@ -564,19 +566,13 @@ public class SortingCollection<T> implements Iterable<T> {
         }
 
         public void close() {
+            System.out.println("decode time: " + decodeTime);
             while (!this.queue.isEmpty()) {
                 final PeekFileRecordIterator it = this.queue.pollFirst();
                 ((CloseableIterator<T>)it.getUnderlyingIterator()).close();
             }
         }
 
-        public boolean isInOneGroup() {
-            return inOneGroup;
-        }
-
-        public void setGroupFlag(boolean flag) {
-            inOneGroup = flag;
-        }
     }
 
     /**
@@ -585,6 +581,8 @@ public class SortingCollection<T> implements Iterable<T> {
     class FileRecordIterator implements CloseableIterator<T> {
         private final File file;
         private final FileInputStream is;
+        FileChannel fileChannel;
+        MappedByteBuffer buffer;
         private final Codec<T> codec;
         private T currentRecord = null;
 
@@ -592,8 +590,14 @@ public class SortingCollection<T> implements Iterable<T> {
             this.file = file;
             try {
                 this.is = new FileInputStream(file);
+                try {
+                    buffer = is.getChannel().map(FileChannel.MapMode.READ_ONLY, 0, file.length());
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
                 this.codec = SortingCollection.this.codec.clone();
-                this.codec.setInputStream(tempStreamFactory.wrapTempInputStream(this.is, Defaults.BUFFER_SIZE));
+                this.codec.setMappedBuffer(buffer);
+//                this.codec.setInputStream(tempStreamFactory.wrapTempInputStream(this.is, Defaults.BUFFER_SIZE));
                 advance();
             }
             catch (FileNotFoundException e) {
@@ -604,13 +608,14 @@ public class SortingCollection<T> implements Iterable<T> {
         public boolean hasNext() {
             return this.currentRecord != null;
         }
-
         public T next() {
             if (!hasNext()) {
                 throw new NoSuchElementException();
             }
             final T ret = this.currentRecord;
+            long time = System.currentTimeMillis();
             advance();
+            decodeTime += System.currentTimeMillis() - time;
             return ret;
         }
 
@@ -623,6 +628,11 @@ public class SortingCollection<T> implements Iterable<T> {
         }
 
         public void close() {
+            try {
+                fileChannel.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
             CloserUtil.close(this.is);
         }
     }
